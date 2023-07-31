@@ -368,6 +368,11 @@ class SlackBackend : Backend {
                 $sendTo = "@$($this.UserIdToUsername($Response.MessageFrom))"
             }
 
+            $threadId = [string]::Empty
+            if ($customResponse.TH) {
+                $threadId = "@$($Response.OriginalMessage.RawMessage.ts)"
+            }
+
             switch -Regex ($customResponse.PSObject.TypeNames[0]) {
                 '(.*?)PoshBot\.Card\.Response' {
                     $this.LogDebug('Custom response is [PoshBot.Card.Response]')
@@ -420,7 +425,11 @@ class SlackBackend : Backend {
                             $attParams.Text = [string]::Empty
                         }
                         $att = New-SlackMessageAttachment @attParams
-                        $msg = $att | New-SlackMessage -Channel $sendTo -AsUser
+                        if([string]::IsNullOrEmpty($threadId)){
+                            $msg = $att | New-SlackMessage -Channel $sendTo -AsUser
+                        }else{
+                            $msg = $att | New-SlackMessage -Channel $sendTo -AsUser -Thread $threadId
+                        }
                         $this.LogDebug("Sending card response back to Slack channel [$sendTo]", $att)
                         $msg | Send-SlackMessage -Token $this.Connection.Config.Credential.GetNetworkCredential().Password -Verbose:$false > $null
                     }
@@ -436,7 +445,11 @@ class SlackBackend : Backend {
                             $t = $chunk
                         }
                         $this.LogDebug("Sending text response back to Slack channel [$sendTo]", $t)
-                        Send-SlackMessage -Token $this.Connection.Config.Credential.GetNetworkCredential().Password -Channel $sendTo -Text $t -Verbose:$false -AsUser > $null
+                        if([string]::IsNullOrEmpty($threadId)){
+                            Send-SlackMessage -Token $this.Connection.Config.Credential.GetNetworkCredential().Password -Channel $sendTo -Text $t -Verbose:$false -AsUser  > $null
+                        }else{
+                            Send-SlackMessage -Token $this.Connection.Config.Credential.GetNetworkCredential().Password -Channel $sendTo -Text $t -Verbose:$false -AsUser -Thread $threadId  > $null
+                        }
                     }
                     break
                 }

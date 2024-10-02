@@ -163,12 +163,17 @@ class SlackAppSMBackend : Backend {
         yellowgreen = "#9ACD32"
     }
 
-    SlackAppSMBackend ([string]$Token) {
+    SlackAppSMBackend ([string]$Token,[string]$TokenApp) {
         Import-Module PSSlack -Verbose:$false -ErrorAction Stop
 
         $config = [ConnectionConfig]::new()
+
         $secToken = $Token | ConvertTo-SecureString -AsPlainText -Force
+        $secTokenApp = $TokenApp | ConvertTo-SecureString -AsPlainText -Force
+
         $config.Credential = New-Object System.Management.Automation.PSCredential('asdf', $secToken)
+        $config.CredentialApp = New-Object System.Management.Automation.PSCredential('asdf', $secTokenApp)
+
         $conn = [SlackAppSMConnection]::New()
         $conn.Config = $config
         $this.Connection = $conn
@@ -569,6 +574,9 @@ class SlackAppSMBackend : Backend {
     [void]LoadUsers() {
         $this.LogDebug('Getting Slack users')
         $allUsers = Get-Slackuser -Token $this.Connection.Config.Credential.GetNetworkCredential().Password -Verbose:$false
+
+        # $allUsers = Get-Slackuser -Token $token_bot -Verbose:$false
+
         $this.LogDebug("[$($allUsers.Count)] users returned")
         $allUsers | ForEach-Object {
             $user = [SlackPerson]::new()
@@ -888,7 +896,7 @@ function New-PoshBotSlackAppSMBackend {
                 throw 'Configuration is missing [Token] parameter'
             } else {
                 Write-Verbose 'Creating new Slack backend instance'
-                $backend = [SlackAppSMBackend]::new($item.Token)
+                $backend = [SlackAppSMBackend]::new($item.Token,$item.TokenApp)
                 if ($item.Name) {
                     $backend.Name = $item.Name
                 }

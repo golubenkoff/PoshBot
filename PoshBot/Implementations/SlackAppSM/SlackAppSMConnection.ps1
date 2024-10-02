@@ -18,24 +18,47 @@ class SlackAppSMConnection : Connection {
 
     # Log in to Slack with the bot token and get a URL to connect to via websockets
     [void]RtmConnect() {
-        $token = $this.Config.Credential.GetNetworkCredential().Password  # xapp-...
+        $token_app = $this.Config.CredentialApp.GetNetworkCredential().Password  # xapp-...
+        $token_bot = $this.Config.Credential.GetNetworkCredential().Password  # xapp-...
         # $url = "https://slack.com/api/rtm.connect?token=$($token)&pretty=1"
+
+        # https://api.slack.com/apis/socket-mode
         $url = 'https://slack.com/api/apps.connections.open'
 
         try {
 
             $r = Invoke-RestMethod -Method POST -Uri $url -Verbose:$false -Headers @{
                 'Content-type' = 'application/x-www-form-urlencoded'
-                Authorization  = "Bearer $token"
+                Authorization  = "Bearer $token_app"
             }
 
+            $rb = Invoke-RestMethod -Method POST -Uri 'https://slack.com/api/auth.test?pretty=1' -Verbose:$false -Headers @{
+                'Content-type' = 'application/x-www-form-urlencoded'
+                Authorization  = "Bearer $token_bot"
+            }
+
+            $rc = Invoke-RestMethod -Method GET -Uri 'https://slack.com/api/conversations.list' -Headers @{
+                'Content-type' = 'application/x-www-form-urlencoded'
+                Authorization  = "Bearer $token_bot"
+            }
+            #$rc.channels
+            # LoginData.self.id
+            # $this.Connection.LoginData.channels
+
             # $r = Invoke-RestMethod -Uri $url -Method Get -Verbose:$false
-            $this.LoginData = $r
+            # $this.LoginData = $r
+            $this.LoginData = [PsCustomObject]@{
+                channels = $rc.channels
+                self     = [PsCustomObject]@{
+                    id = $rb.user_id
+                }
+            }
+
             if ($r.ok) {
                 $this.LogInfo('Successfully authenticated to Slack Real Time API')
                 $this.WebSocketUrl = $r.url
-                $this.Domain = $r.team.domain
-                $this.UserName = $r.self.name
+                $this.Domain = $rb.team #$rb.team.domain
+                $this.UserName = $rb.user #$r.self.name
             } else {
                 throw $r
             }
@@ -144,7 +167,30 @@ class SlackAppSMConnection : Connection {
                     $webSocket.State -ne [Net.WebSockets.WebSocketState]::Open -or $taskResult.Result.EndOfMessage
                 )
 
+
+
                 if (-not [string]::IsNullOrEmpty($jsonResult)) {
+
+                    #region acknowledgment
+                        # Prepare the acknowledgment message
+                        $ackPayload = @{
+                            envelope_id = ($jsonResult | convertfrom-json).envelope_id
+                        } | ConvertTo-Json
+
+                        # Convert the message to bytes
+                        $ackBytes = [System.Text.Encoding]::UTF8.GetBytes($ackPayload)
+
+                        # Send the acknowledgment
+                        $sendBuffer = [ArraySegment[byte]]$ackBytes
+                        # Send - v1
+                        # $sendTask = $webSocket.SendAsync($sendBuffer, [Net.WebSockets.WebSocketMessageType]::Text, $true, $ct)
+                        # $sendTask.Wait()
+
+                        # Send - v2
+                        $webSocket.SendAsync($sendBuffer, [Net.WebSockets.WebSocketMessageType]::Text, $true, $ct).GetAwaiter().GetResult() > $null
+
+                    #endregion acknowledgment
+
                     # Write-Debug "Received JSON: $jsonResult"
                     $sanitizedJson = SanitizeURIs -Text $jsonResult
 

@@ -83,6 +83,7 @@ FunctionsToExport = @(
     'New-PoshBotMiddlewareHook'
     'New-PoshBotScheduledTask'
     'New-PoshBotSlackBackend'
+    'New-PoshBotSlackAppSMBackend'
     'New-PoshBotTeamsBackend'
     'New-HelloPlugin'
     'New-PoshBotCardResponse'

@@ -18,9 +18,8 @@ class SlackAppSMConnection : Connection {
 
     # Log in to Slack with the bot token and get a URL to connect to via websockets
     [void]RtmConnect() {
-        $token_app = $this.Config.CredentialApp.GetNetworkCredential().Password  # xapp-...
-        $token_bot = $this.Config.Credential.GetNetworkCredential().Password  # xapp-...
-        # $url = "https://slack.com/api/rtm.connect?token=$($token)&pretty=1"
+        $token_app = $this.Config.CredentialApp.GetNetworkCredential().Password  # xapp...
+        $token_bot = $this.Config.Credential.GetNetworkCredential().Password     # xoxb...
 
         # https://api.slack.com/apis/socket-mode
         $url = 'https://slack.com/api/apps.connections.open'
@@ -41,12 +40,7 @@ class SlackAppSMConnection : Connection {
                 'Content-type' = 'application/x-www-form-urlencoded'
                 Authorization  = "Bearer $token_bot"
             }
-            #$rc.channels
-            # LoginData.self.id
-            # $this.Connection.LoginData.channels
 
-            # $r = Invoke-RestMethod -Uri $url -Method Get -Verbose:$false
-            # $this.LoginData = $r
             $this.LoginData = [PsCustomObject]@{
                 channels = $rc.channels
                 self     = [PsCustomObject]@{
@@ -57,8 +51,8 @@ class SlackAppSMConnection : Connection {
             if ($r.ok) {
                 $this.LogInfo('Successfully authenticated to Slack Real Time API')
                 $this.WebSocketUrl = $r.url
-                $this.Domain = $rb.team #$rb.team.domain
-                $this.UserName = $rb.user #$r.self.name
+                $this.Domain = $rb.team   # .team.domain
+                $this.UserName = $rb.user # .self.name
             } else {
                 throw $r
             }
@@ -168,39 +162,52 @@ class SlackAppSMConnection : Connection {
                 )
 
 
-
                 if (-not [string]::IsNullOrEmpty($jsonResult)) {
 
                     #region acknowledgment
-                        # Prepare the acknowledgment message
-                        $ackPayload = @{
-                            envelope_id = ($jsonResult | convertfrom-json).envelope_id
-                        } | ConvertTo-Json
+                    # Prepare the acknowledgment message
+                    $ackPayload = @{
+                        envelope_id = ($jsonResult | ConvertFrom-Json).envelope_id
+                    } | ConvertTo-Json
 
-                        # Convert the message to bytes
-                        $ackBytes = [System.Text.Encoding]::UTF8.GetBytes($ackPayload)
+                    # Convert the message to bytes
+                    $ackBytes = [System.Text.Encoding]::UTF8.GetBytes($ackPayload)
 
-                        # Send the acknowledgment
-                        $sendBuffer = [ArraySegment[byte]]$ackBytes
-                        # Send - v1
-                        # $sendTask = $webSocket.SendAsync($sendBuffer, [Net.WebSockets.WebSocketMessageType]::Text, $true, $ct)
-                        # $sendTask.Wait()
+                    # Send the acknowledgment
+                    $sendBuffer = [ArraySegment[byte]]$ackBytes
+                    # Send - v1
+                    # $sendTask = $webSocket.SendAsync($sendBuffer, [Net.WebSockets.WebSocketMessageType]::Text, $true, $ct)
+                    # $sendTask.Wait()
 
-                        # Send - v2
-                        $webSocket.SendAsync($sendBuffer, [Net.WebSockets.WebSocketMessageType]::Text, $true, $ct).GetAwaiter().GetResult() > $null
+                    # Send - v2
+                    $webSocket.SendAsync($sendBuffer, [Net.WebSockets.WebSocketMessageType]::Text, $true, $ct).GetAwaiter().GetResult() > $null
 
                     #endregion acknowledgment
 
-                    # Write-Debug "Received JSON: $jsonResult"
+
+                    #region get messages
                     $sanitizedJson = SanitizeURIs -Text $jsonResult
 
-                    $msgs = ConvertFrom-Json $sanitizedJson | Select-Object -ExpandProperty payload | Select-Object -ExpandProperty event
+                    $msgs = ConvertFrom-Json $sanitizedJson | ForEach-Object {
+                        $msgRawData = $null ; $msgRawData = $_
+                        switch ($msgRawData.type) {
+                            'slash_commands' {
+                                $msgRawData | Select-Object -ExpandProperty payload | Select-Object @{N = 'user';E = { $_.user_id } },@{N = 'type';E = { 'message' } },@{N = 'text';E = { ($_.command -replace '\\\/','!') + ' ' + ($_.text) } },@{N = 'slash_command_text';E = { $_.text } },@{N = 'team';E = { $_.team_id } },@{N = 'channel';E = { $_.channel_id } },@{N = 'channel_type';E = { 'im' } }
+                            }
+                            default {
+                                $msgRawData | Select-Object -ExpandProperty payload | Select-Object -ExpandProperty event
+                            }
+                        }
+                    }
+
                     foreach ($msg in $msgs) {
                         # Ingore "pong" and "hello" messages as they aren't important to the backend
                         if ($msg.type -ne 'pong' -and $msg.type -ne 'hello') {
                             $msg
                         }
                     }
+                    #endregion get messages
+
                 }
             }
 

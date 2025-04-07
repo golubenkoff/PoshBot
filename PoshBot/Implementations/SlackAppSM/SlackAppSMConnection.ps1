@@ -192,7 +192,7 @@ class SlackAppSMConnection : Connection {
                         $msgRawData = $null ; $msgRawData = $_
                         switch ($msgRawData.type) {
                             'slash_commands' {
-                                $msgRawData | Select-Object -ExpandProperty payload | Select-Object @{N = 'user';E = { $_.user_id } },@{N = 'type';E = { 'message' } },@{N = 'text';E = { ($_.command -replace '\\\/','!') + ' ' + ($_.text) } },@{N = 'slash_command_text';E = { $_.text } },@{N = 'team';E = { $_.team_id } },@{N = 'channel';E = { $_.channel_id } },@{N = 'channel_type';E = { 'im' } }
+                                $msgRawData | Select-Object -ExpandProperty payload | Select-Object @{N = 'user';E = { $_.user_id } },@{N = 'type';E = { 'message' } },@{N = 'text';E = { ($_.command -replace '\\\/','!' -replace '\/','!') + ' ' + ($_.text) } },@{N = 'slash_command_text';E = { $_.text } },@{N = 'team';E = { $_.team_id } },@{N = 'channel';E = { $_.channel_id } },@{N = 'channel_type';E = { 'im' } }
                             }
                             default {
                                 $msgRawData | Select-Object -ExpandProperty payload | Select-Object -ExpandProperty event

@@ -13,6 +13,9 @@ function New-PoshBotTextResponse {
         Format the text in a code block if the backend supports it.
     .PARAMETER DM
         Tell PoshBot to redirect the response to a DM channel.
+    .PARAMETER TH
+        Tell PoshBot to post the response as a thread reply to the calling message (Slack backends).
+        If the calling message is already inside a thread, responses always go to that thread.
     .EXAMPLE
         function Get-Foo {
             [cmdletbinding()]

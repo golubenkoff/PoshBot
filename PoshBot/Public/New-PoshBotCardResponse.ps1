@@ -18,6 +18,9 @@ function New-PoshBotCardResponse {
         The text response from the command.
     .PARAMETER DM
         Tell PoshBot to redirect the response to a DM channel.
+    .PARAMETER TH
+        Tell PoshBot to post the response as a thread reply to the calling message (Slack backends).
+        If the calling message is already inside a thread, responses always go to that thread.
     .PARAMETER Title
         The title of the response. This will be the card title in chat networks like Slack.
     .PARAMETER ThumbnailUrl
@@ -142,8 +145,8 @@ function New-PoshBotCardResponse {
         Type = $Type
         Text = $Text.Trim()
         Private = $PSBoundParameters.ContainsKey('Private')
-        DM = $PSBoundParameters['DM']
-        TH = $PSBoundParameters['TH']
+        DM = $DM.IsPresent
+        TH = $TH.IsPresent
     }
     if ($PSBoundParameters.ContainsKey('Title')) {
         $response.Title = $Title

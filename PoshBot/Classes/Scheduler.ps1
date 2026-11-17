@@ -110,6 +110,10 @@ class Scheduler : BaseLogger {
 
                 $newMsg = $_.Value.Message.Clone()
                 $newMsg.Time = [datetime]::UtcNow
+                # Mark as scheduled: RawMessage belongs to the message that CREATED the schedule,
+                # backends must not auto-reply into that (old) thread
+                if ($null -eq $newMsg.Options) { $newMsg.Options = @{} }
+                $newMsg.Options['Scheduled'] = $true
                 $newMsg
             }
         })

@@ -8,10 +8,13 @@ class SlackClient {
     [string]$psEdition
 
     SlackClient([securestring]$token) {
-        # $this.token = $token | ConvertFrom-SecureString -AsPlainText
-        $this.token = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto(
-            [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($token)
-        )
+        # PtrToStringBSTR (not PtrToStringAuto) - correct on both Windows and Linux
+        $bstr = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($token)
+        try {
+            $this.token = [System.Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
+        } finally {
+            [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
+        }
         $this.headers = @{
             Authorization = "Bearer $($this.Token)"
         }
@@ -43,7 +46,7 @@ class SlackClient {
     }
 
     [pscustomobject]_SendAPI([string]$Function, [string]$Method) {
-        $uri = "$($this.BaseUri)/$Function"
+        $uri = "$($this.BaseUri)$Function"
 
         $params = @{
             Uri         = $uri
@@ -61,7 +64,7 @@ class SlackClient {
     }
 
     [pscustomobject]_SendAPI([string]$Function, [string]$Body, [string]$Method) {
-        $uri = "$($this.BaseUri)/$Function"
+        $uri = "$($this.BaseUri)$Function"
 
         $params = @{
             Uri               = $uri
@@ -81,39 +84,56 @@ class SlackClient {
     }
 
     [pscustomobject]UploadFileToChannel([string]$Channel, [string]$FilePath, [string]$FileName) {
+        return $this.UploadFileToChannel($Channel, $FilePath, $FileName, [string]::Empty)
+    }
 
-        # Get URL to upoad file to
+    # Upload flow (files.upload is retired):
+    #   1. files.getUploadURLExternal (POST, form-urlencoded: filename, length) -> upload_url, file_id
+    #   2. POST raw bytes to upload_url (HTTP 200 = ok)
+    #   3. files.completeUploadExternal (files[], channel_id, optional thread_ts = PARENT ts)
+    # $Channel must be a conversation ID (C.../G.../D...), not a user ID.
+    [pscustomobject]UploadFileToChannel([string]$Channel, [string]$FilePath, [string]$FileName, [string]$ThreadTs) {
+
+        $file = Get-Item -LiteralPath $FilePath -ErrorAction Stop
+        if ([string]::IsNullOrEmpty($FileName)) {
+            $FileName = $file.Name
+        }
+
+        # 1. Get URL to upload file to
         $body = @{
-            filename = $FileName
-            length   = (Get-Item $FilePath).Length
+            filename = $file.Name
+            length   = $file.Length
         }
-        $r = Invoke-RestMethod -Uri "$($this.BaseUri)/files.getUploadURLExternal" -Body $body -Method Get -ContentType 'application/x-www-form-urlencoded; charset=utf-8' -Headers $this.headers
-
-        if ($r.ok) {
-            $uploadUrl = $r.upload_url
-            $file_id = $r.file_id
-
-            # Upload file
-            $r = Invoke-WebRequest -Uri $uploadUrl -Method Post -InFile $FilePath -Headers $this.headers -ContentType 'application/octet-stream'
-            if ($r.StatusCode -eq 200) {
-
-                # Shage file with channel
-                $completeUploadPayload = @{
-                    files      = @(
-                        @{
-                            id    = $file_id
-                            title = $FileName
-                        }
-                    )
-                    channel_id = $Channel
-                } | ConvertTo-Json -Compress
-                $r = $this._SendAPI('files.completeUploadExternal', $completeUploadPayload, 'Post')
-                return $r
-            } else {
-                throw "Error: $($r.StatusCode) $($r.StatusDescription)"
-            }
-        } else {
-            throw "Error: $($r.error)"
+        $r = Invoke-RestMethod -Uri "$($this.BaseUri)files.getUploadURLExternal" -Body $body -Method Post -ContentType 'application/x-www-form-urlencoded; charset=utf-8' -Headers $this.headers
+        if (-not $r.ok) {
+            throw "files.getUploadURLExternal failed: $($r.error)"
         }
+        $uploadUrl = $r.upload_url
+        $fileId = $r.file_id
+
+        # 2. Upload bytes
+        $u = Invoke-WebRequest -Uri $uploadUrl -Method Post -InFile $file.FullName -Headers $this.headers -ContentType 'application/octet-stream' -UseBasicParsing
+        if ($u.StatusCode -ne 200) {
+            throw "Upload to upload_url failed: $($u.StatusCode) $($u.StatusDescription)"
+        }
+
+        # 3. Share file with channel (and thread)
+        $complete = @{
+            files      = @(
+                @{
+                    id    = $fileId
+                    title = $FileName
+                }
+            )
+            channel_id = $Channel
+        }
+        if (-not [string]::IsNullOrEmpty($ThreadTs)) {
+            $complete.thread_ts = $ThreadTs
+        }
+        $r = $this._SendAPI('files.completeUploadExternal', ($complete | ConvertTo-Json -Depth 5 -Compress), 'Post')
+        if (-not $r.ok) {
+            throw "files.completeUploadExternal failed: $($r.error)"
+        }
+        return $r
     }
 }

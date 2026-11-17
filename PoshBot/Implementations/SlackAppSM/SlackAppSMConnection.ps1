@@ -126,7 +126,8 @@ class SlackAppSMConnection : Connection {
                 [System.Net.ServicePointManager]::MaxServicePointIdleTime = [Int]::MaxValue
             }
             $webSocket = [Net.WebSockets.ClientWebSocket]::new()
-            $webSocket.Options.KeepAliveInterval = 5
+            # NB: assigning a bare int (5) gives 5 *ticks* (0.5 microseconds), not 5 seconds
+            $webSocket.Options.KeepAliveInterval = [TimeSpan]::FromSeconds(5)
             $cts = [Threading.CancellationTokenSource]::new()
             $task = $webSocket.ConnectAsync($url, $cts.Token)
             do { [Threading.Thread]::Sleep(10) }
@@ -164,26 +165,36 @@ class SlackAppSMConnection : Connection {
 
                 if (-not [string]::IsNullOrEmpty($jsonResult)) {
 
+                    $envelope = $null
+                    try {
+                        $envelope = $jsonResult | ConvertFrom-Json
+                    } catch {
+                        Write-Warning "Unable to parse Socket Mode message: $($_.Exception.Message)"
+                        continue
+                    }
+
                     #region acknowledgment
-                    # Prepare the acknowledgment message
-                    $ackPayload = @{
-                        envelope_id = ($jsonResult | ConvertFrom-Json).envelope_id
-                    } | ConvertTo-Json
-
-                    # Convert the message to bytes
-                    $ackBytes = [System.Text.Encoding]::UTF8.GetBytes($ackPayload)
-
-                    # Send the acknowledgment
-                    $sendBuffer = [ArraySegment[byte]]$ackBytes
-                    # Send - v1
-                    # $sendTask = $webSocket.SendAsync($sendBuffer, [Net.WebSockets.WebSocketMessageType]::Text, $true, $ct)
-                    # $sendTask.Wait()
-
-                    # Send - v2
-                    $webSocket.SendAsync($sendBuffer, [Net.WebSockets.WebSocketMessageType]::Text, $true, $ct).GetAwaiter().GetResult() > $null
-
+                    # Every envelope with an envelope_id (events_api / slash_commands / interactive)
+                    # must be acknowledged, otherwise Slack retries the delivery.
+                    # 'hello' and 'disconnect' have no envelope_id and must not be acked.
+                    if ($envelope.envelope_id) {
+                        $ackPayload = @{ envelope_id = $envelope.envelope_id } | ConvertTo-Json -Compress
+                        $sendBuffer = [ArraySegment[byte]][System.Text.Encoding]::UTF8.GetBytes($ackPayload)
+                        $webSocket.SendAsync($sendBuffer, [Net.WebSockets.WebSocketMessageType]::Text, $true, $ct).GetAwaiter().GetResult() > $null
+                    }
                     #endregion acknowledgment
 
+                    if ($envelope.type -eq 'hello') {
+                        Write-Verbose "Socket Mode [hello]. Approximate connection time [$($envelope.debug_info.approximate_connection_time)] sec"
+                        continue
+                    }
+
+                    if ($envelope.type -eq 'disconnect') {
+                        # Slack refreshes Socket Mode connections every few hours (reason: refresh_requested / warning / link_disabled).
+                        # Leave the loop -> the job ends -> SlackAppSMConnection.ReadReceiveJob() reconnects.
+                        Write-Warning "Socket Mode [disconnect] received. Reason [$($envelope.reason)]. Reconnecting..."
+                        break
+                    }
 
                     #region get messages
                     $sanitizedJson = SanitizeURIs -Text $jsonResult
@@ -194,8 +205,12 @@ class SlackAppSMConnection : Connection {
                             'slash_commands' {
                                 $msgRawData | Select-Object -ExpandProperty payload | Select-Object @{N = 'user';E = { $_.user_id } },@{N = 'type';E = { 'message' } },@{N = 'text';E = { ($_.command -replace '\\\/','!' -replace '\/','!') + ' ' + ($_.text) } },@{N = 'slash_command_text';E = { $_.text } },@{N = 'team';E = { $_.team_id } },@{N = 'channel';E = { $_.channel_id } },@{N = 'channel_type';E = { 'im' } }
                             }
+                            'events_api' {
+                                $msgRawData.payload.event
+                            }
                             default {
-                                $msgRawData | Select-Object -ExpandProperty payload | Select-Object -ExpandProperty event
+                                # e.g. 'interactive' (buttons / modals) - not handled by PoshBot yet
+                                Write-Verbose "Ignoring Socket Mode envelope type [$($msgRawData.type)]"
                             }
                         }
                     }

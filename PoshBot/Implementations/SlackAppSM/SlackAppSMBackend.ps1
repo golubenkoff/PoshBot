@@ -21,6 +21,9 @@ class SlackAppSMBackend : Backend {
 
     [int]$MaxMessageLength = 3900
 
+    # Cache: user ID -> DM conversation ID (conversations.open)
+    hidden [hashtable]$_DmChannelCache = @{}
+
     # Import some color defs.
     hidden [hashtable]$_PSSlackColorMap = @{
         aliceblue            = '#F0F8FF'
@@ -368,14 +371,16 @@ class SlackAppSMBackend : Backend {
         $this.LogDebug("[$($Response.Data.Count)] custom responses")
         foreach ($customResponse in $Response.Data) {
 
-            [string]$sendTo = $Response.To
-            if ($customResponse.DM) {
-                $sendTo = "@$($this.UserIdToUsername($Response.MessageFrom))"
-            }
+            # Where to send: original channel, or a DM with the calling user (-DM)
+            $isDM = [bool]$customResponse.DM
+            [string]$sendTo = $this._ResolveSendTo($Response, $isDM)
 
+            # Thread: reply into the thread when -TH was requested OR when the command
+            # itself was posted inside a thread. A DM redirected out of a channel can't
+            # be threaded (the parent message lives in another conversation).
             $threadId = [string]::Empty
-            if ($customResponse.TH) {
-                $threadId = "@$($Response.OriginalMessage.RawMessage.ts)"
+            if (-not ($isDM -and -not $Response.OriginalMessage.IsDM)) {
+                $threadId = $this._ResolveThreadTs($Response, [bool]$customResponse.TH)
             }
 
             switch -Regex ($customResponse.PSObject.TypeNames[0]) {
@@ -461,54 +466,59 @@ class SlackAppSMBackend : Backend {
                 '(.*?)PoshBot\.File\.Upload' {
                     $this.LogDebug('Custom response is [PoshBot.File.Upload]')
 
-                    $uploadParams = @{
-                        Token   = $this.Connection.Config.Credential.GetNetworkCredential().Password
-                        Channel = $sendTo
-                    }
+                    $token = $this.Connection.Config.Credential.GetNetworkCredential().Password
+                    $filePath = $null
+                    $isTempFile = $false
+                    $title = $null
 
                     if ([string]::IsNullOrEmpty($customResponse.Path) -and (-not [string]::IsNullOrEmpty($customResponse.Content))) {
-                        $uploadParams.Content = $customResponse.Content
-                        if (-not [string]::IsNullOrEmpty($customResponse.FileType)) {
-                            $uploadParams.FileType = $customResponse.FileType
+                        # -Content: the new upload API needs real bytes, so write the content to a temp file
+                        $fileName = $customResponse.FileName
+                        if ([string]::IsNullOrEmpty($fileName)) {
+                            $ext = 'txt'
+                            if (-not [string]::IsNullOrEmpty($customResponse.FileType)) { $ext = $customResponse.FileType }
+                            $fileName = "content.$ext"
                         }
-                        if (-not [string]::IsNullOrEmpty($customResponse.FileName)) {
-                            $uploadParams.FileName = $customResponse.FileName
-                        }
+                        $tempDir = Join-Path -Path ([IO.Path]::GetTempPath()) -ChildPath ([guid]::NewGuid().ToString())
+                        New-Item -Path $tempDir -ItemType Directory -Force > $null
+                        $filePath = Join-Path -Path $tempDir -ChildPath $fileName
+                        [IO.File]::WriteAllText($filePath, $customResponse.Content, [Text.UTF8Encoding]::new($false))
+                        $isTempFile = $true
+                        $title = $fileName
                     } else {
                         # Test if file exists and send error response if not found
-                        if (-not (Test-Path -Path $customResponse.Path -ErrorAction SilentlyContinue)) {
+                        if (-not (Test-Path -LiteralPath $customResponse.Path -ErrorAction SilentlyContinue)) {
                             # Mark command as failed since we could't find the file to upload
                             $this.RemoveReaction($Response.OriginalMessage, [ReactionType]::Success)
                             $this.AddReaction($Response.OriginalMessage, [ReactionType]::Failure)
-                            $att = New-SlackMessageAttachment -Color '#FF0000' -Title 'Rut row' -Text "File [$($uploadParams.Path)] not found" -Fallback 'Rut row'
-                            $msg = $att | New-SlackMessage -Channel $sendTo -AsUser
-                            $this.LogDebug("Sending card response back to Slack channel [$sendTo]", $att)
-                            $null = $msg | Send-SlackMessage -Token $this.Connection.Config.Credential.GetNetworkCredential().Password -Verbose:$false
+                            $this._SendErrorCard($sendTo, $threadId, 'Rut row', "File [$($customResponse.Path)] not found")
                             break
                         }
-
-                        $this.LogDebug("Uploading [$($customResponse.Path)] to Slack channel [$sendTo]")
-                        $uploadParams.Path = $customResponse.Path
-                        $uploadParams.Title = Split-Path -Path $customResponse.Path -Leaf
+                        $filePath = $customResponse.Path
+                        $title = Split-Path -Path $customResponse.Path -Leaf
                     }
 
                     if (-not [string]::IsNullOrEmpty($customResponse.Title)) {
-                        $uploadParams.Title = $customResponse.Title
+                        $title = $customResponse.Title
                     }
 
-
-                    # Send-SlackFile @uploadParams -Verbose:$false
                     try {
-                        # $this.Connection.Config.Credential.GetNetworkCredential().Password
-                        $this.LogDebug("Uploading [$($uploadParams.Path)] to Slack channel [$sendTo]")
-                        $SlackClient = [SlackClient]::new($this.Connection.Config.Credential.Password)
-                        $SlackClient.UploadFileToChannel($sendTo,$uploadParams.Path,$uploadParams.Title)
+                        # files.completeUploadExternal needs a conversation ID (C/G/D...), not a user ID
+                        $uploadChannel = $this._ResolveConversationId($sendTo)
+                        $this.LogDebug("Uploading [$filePath] to Slack channel [$uploadChannel] thread [$threadId]")
+                        $slackClient = [SlackClient]::new($this.Connection.Config.Credential.Password)
+                        $slackClient.UploadFileToChannel($uploadChannel, $filePath, $title, $threadId) > $null
                     } catch {
-                        Write-Host 'Error Uploading file: ' $_.Exception.Message
-                        $this.LogDebug("Uploading [$($customResponse.Path)] to Slack channel [$sendTo]")
-                    }
-                    if (-not $customResponse.KeepFile -and -not [string]::IsNullOrEmpty($customResponse.Path)) {
-                        Remove-Item -LiteralPath $customResponse.Path -Force
+                        $this.LogInfo([LogSeverity]::Error, "Error uploading file [$filePath] to Slack channel [$sendTo]", [ExceptionFormatter]::Summarize($_))
+                        $this.RemoveReaction($Response.OriginalMessage, [ReactionType]::Success)
+                        $this.AddReaction($Response.OriginalMessage, [ReactionType]::Failure)
+                        $this._SendErrorCard($sendTo, $threadId, 'File upload failed', "Unable to upload [$title]: $($_.Exception.Message)")
+                    } finally {
+                        if ($isTempFile) {
+                            Remove-Item -LiteralPath (Split-Path -Path $filePath -Parent) -Recurse -Force -ErrorAction SilentlyContinue
+                        } elseif (-not $customResponse.KeepFile -and -not [string]::IsNullOrEmpty($customResponse.Path)) {
+                            Remove-Item -LiteralPath $customResponse.Path -Force -ErrorAction SilentlyContinue
+                        }
                     }
                     break
                 }
@@ -516,10 +526,109 @@ class SlackAppSMBackend : Backend {
         }
 
         if ($Response.Text.Count -gt 0) {
+            # Plain (non-custom) output: same channel, keep it in the thread if the command came from a thread
+            $textTo = $this._ResolveSendTo($Response, $false)
+            $textThread = $this._ResolveThreadTs($Response, $false)
             foreach ($t in $Response.Text) {
-                $this.LogDebug("Sending response back to Slack channel [$($Response.To)]", $t)
-                Send-SlackMessage -Token $this.Connection.Config.Credential.GetNetworkCredential().Password -Channel $Response.To -Text $t -Verbose:$false -AsUser > $null
+                $this.LogDebug("Sending response back to Slack channel [$textTo] thread [$textThread]", $t)
+                $sendParams = @{
+                    Token   = $this.Connection.Config.Credential.GetNetworkCredential().Password
+                    Channel = $textTo
+                    Text    = $t
+                    Verbose = $false
+                    AsUser  = $true
+                }
+                if (-not [string]::IsNullOrEmpty($textThread)) {
+                    $sendParams.Thread = $textThread
+                }
+                Send-SlackMessage @sendParams > $null
             }
+        }
+    }
+
+    # Resolve Slack conversation to post into.
+    # - DM requested from a channel  -> calling user's ID (chat.postMessage opens the DM itself)
+    # - DM requested from a DM       -> the same DM channel (keeps threading possible)
+    # - Response.To = '@username'    -> set by Bot for SendCommandResponseToPrivate; convert to user ID
+    #   (passing "@username" as channel is deprecated by Slack)
+    hidden [string]_ResolveSendTo([Response]$Response, [bool]$DM) {
+        if ($DM) {
+            if ($Response.OriginalMessage.IsDM -and -not [string]::IsNullOrEmpty($Response.To) -and $Response.To -match '^D') {
+                return $Response.To
+            }
+            if (-not [string]::IsNullOrEmpty($Response.MessageFrom)) {
+                return $Response.MessageFrom
+            }
+        }
+        $to = $Response.To
+        if ($to -match '^@') {
+            $userId = $this.UsernameToUserId($to)
+            if ($userId) {
+                return $userId
+            }
+        }
+        return $to
+    }
+
+    # Resolve thread_ts for a reply. Slack: "Avoid using a reply's ts value; use its parent instead."
+    # - incoming message is a thread reply/parent -> use its thread_ts (the parent ts)
+    # - -TH requested on a top-level message      -> use the message ts (it becomes the parent)
+    hidden [string]_ResolveThreadTs([Response]$Response, [bool]$ForceThread) {
+        $raw = $Response.OriginalMessage.RawMessage
+        if ($null -eq $raw) {
+            return [string]::Empty
+        }
+        # Scheduled command: RawMessage is the message that created the schedule.
+        # Only thread when the command explicitly asked for it (-TH), never automatically.
+        $opts = $Response.OriginalMessage.Options
+        if ($opts -and $opts['Scheduled'] -and -not $ForceThread) {
+            return [string]::Empty
+        }
+        if (-not [string]::IsNullOrEmpty($raw.thread_ts)) {
+            return [string]$raw.thread_ts
+        }
+        # message_changed events keep the real message under .message
+        if ($raw.message -and -not [string]::IsNullOrEmpty($raw.message.thread_ts)) {
+            return [string]$raw.message.thread_ts
+        }
+        if ($ForceThread) {
+            if (-not [string]::IsNullOrEmpty($raw.ts)) {
+                return [string]$raw.ts
+            }
+            $this.LogDebug([LogSeverity]::Warning, 'Thread reply requested but original message has no [ts] (slash command / scheduled?). Posting to channel')
+        }
+        return [string]::Empty
+    }
+
+    # Convert a user ID (U.../W...) into a DM conversation ID via conversations.open (scope im:write).
+    # Channel/DM IDs are returned as-is.
+    hidden [string]_ResolveConversationId([string]$Target) {
+        if ($Target -notmatch '^[UW][A-Z0-9]+$') {
+            return $Target
+        }
+        if ($this._DmChannelCache.ContainsKey($Target)) {
+            return $this._DmChannelCache[$Target]
+        }
+        $resp = Send-SlackApi -Token $this.Connection.Config.Credential.GetNetworkCredential().Password -Method 'conversations.open' -Body @{ users = $Target } -Verbose:$false
+        if ($resp.ok -and $resp.channel.id) {
+            $this._DmChannelCache[$Target] = $resp.channel.id
+            return $resp.channel.id
+        }
+        throw "Unable to open DM conversation with user [$Target]: $($resp.error)"
+    }
+
+    # Small red card, used for upload errors
+    hidden [void]_SendErrorCard([string]$Channel, [string]$ThreadTs, [string]$Title, [string]$Text) {
+        try {
+            $att = New-SlackMessageAttachment -Color '#FF0000' -Title $Title -Text $Text -Fallback $Title
+            if ([string]::IsNullOrEmpty($ThreadTs)) {
+                $msg = $att | New-SlackMessage -Channel $Channel -AsUser
+            } else {
+                $msg = $att | New-SlackMessage -Channel $Channel -AsUser -Thread $ThreadTs
+            }
+            $msg | Send-SlackMessage -Token $this.Connection.Config.Credential.GetNetworkCredential().Password -Verbose:$false > $null
+        } catch {
+            $this.LogInfo([LogSeverity]::Error, 'Unable to send error card to Slack', [ExceptionFormatter]::Summarize($_))
         }
     }
 

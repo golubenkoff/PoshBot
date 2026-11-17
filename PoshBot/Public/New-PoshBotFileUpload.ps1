@@ -23,6 +23,8 @@ function New-PoshBotFileUpload {
         The title for the uploaded file.
     .PARAMETER DM
         Tell PoshBot to redirect the file upload to a DM channel.
+    .PARAMETER TH
+        Tell PoshBot to share the file as a thread reply to the calling message (Slack backends).
     .PARAMETER KeepFile
         If specified, keep the source file after calling Send-SlackFile. The source file is deleted without this
     .EXAMPLE
@@ -131,6 +133,8 @@ function New-PoshBotFileUpload {
 
         [switch]$DM,
 
+        [switch]$TH,
+
         [switch]$KeepFile
     )
 
@@ -143,6 +147,7 @@ function New-PoshBotFileUpload {
                 FileType   = $FileType
                 Title      = $Title
                 DM         = $DM.IsPresent
+                TH         = $TH.IsPresent
                 KeepFile   = $KeepFile.IsPresent
             }
         } else {
@@ -159,6 +164,7 @@ function New-PoshBotFileUpload {
                     Path       = $item
                     Title      = $Title
                     DM         = $DM.IsPresent
+                    TH         = $TH.IsPresent
                     KeepFile   = $KeepFile.IsPresent
                 }
             }

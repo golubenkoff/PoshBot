@@ -57,35 +57,28 @@ task Analyze -Depends Build {
 } -description 'Run PSScriptAnalyzer'
 
 task Pester -Depends Build {
-    Import-Module Pester -RequiredVersion 3.4.0
-    Push-Location
-    Set-Location -PassThru $outputModDir
-    if(-not $ENV:BHProjectPath) {
-        Set-BuildEnvironment -Path $PSScriptRoot\..
-    }
-
-    $origModulePath = $env:PSModulePath
-    if ( $env:PSModulePath.split($pathSeperator) -notcontains $outputDir ) {
-        $env:PSModulePath = ($outputDir + $pathSeperator + $origModulePath)
-    }
-
-    Remove-Module $ENV:BHProjectName -ErrorAction SilentlyContinue -Verbose:$false
-    Import-Module -Name $outputModDir -Force -Verbose:$false
     $testResultsXml = Join-Path -Path $outputDir -ChildPath 'testResults.xml'
-    $testResults = Invoke-Pester -Path $tests -PassThru -OutputFile $testResultsXml -OutputFormat NUnitXml
+
+    # Run in a separate process: Pester inside the psake session fails on Windows PowerShell
+    # (see Tests/Invoke-PoshBotTests.ps1). The customized PSSlack loaded by build.ps1 is passed along.
+    $runner = Join-Path -Path $tests -ChildPath 'Invoke-PoshBotTests.ps1'
+    $pssPath = (Get-Module -Name PSSlack -ErrorAction SilentlyContinue | Select-Object -First 1).Path
+    $psExe = (Get-Process -Id $PID).Path
+    $runnerArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $runner,
+                    '-ProjectRoot', $projectRoot, '-OutputDir', $outputDir, '-ResultsXml', $testResultsXml)
+    if ($pssPath) { $runnerArgs += @('-PSSlackPath', $pssPath) }
+    & $psExe @runnerArgs
+    $failed = $LASTEXITCODE
 
     # Upload test artifacts to AppVeyor
-    if ($env:APPVEYOR_JOB_ID) {
+    if ($env:APPVEYOR_JOB_ID -and (Test-Path -Path $testResultsXml)) {
         $wc = New-Object 'System.Net.WebClient'
         $wc.UploadFile("https://ci.appveyor.com/api/testresults/nunit/$($env:APPVEYOR_JOB_ID)", $testResultsXml)
     }
 
-    if ($testResults.FailedCount -gt 0) {
-        $testResults | Format-List
-        Write-Error -Message 'One or more Pester tests failed. Build cannot continue!'
+    if ($failed -ne 0) {
+        Write-Error -Message "Pester failed or reported [$failed] failed test(s). Build cannot continue!"
     }
-    Pop-Location
-    $env:PSModulePath = $origModulePath
 } -description 'Run Pester tests'
 
 task CreateMarkdownHelp -Depends Compile {

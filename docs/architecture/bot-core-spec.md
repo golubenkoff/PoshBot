@@ -347,7 +347,7 @@ Permissions плагина FuibBotPlugin: `osp, uib, sd, superadmin, ad-write-us
 7. Таймаута выполнения у job нет; зависшая команда висит в `_jobTracker` бесконечно.
 8. Объект ответа проходит сериализацию job (`Deserialized.*`), поэтому switch-поля `DM`/`TH` хранятся как `bool` (иначе всегда truthy).
 9. `Response.Text` (простой вывод) не умеет `DM`.
-10. Slack: `Send-SlackApi` (PSSlack) отправляет параметры в query-строке — для длинного текста лучше POST JSON.
+10. Slack: бекенд использует PSSlack (форк PSSlackAG 1.0.6a) для большинства вызовов; в .NET заменить на прямые вызовы Web API (JSON POST).
 
 ## 13. Рекомендации для .NET (проектные, не часть текущего кода)
 

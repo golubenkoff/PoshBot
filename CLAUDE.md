@@ -35,14 +35,18 @@
 ## 2. Сборка и деплой
 
 ```powershell
-./build.ps1 -Task Compile          # склеивает всё в out/PoshBot/<ModuleVersion>/PoshBot.psm1
-./build.ps1 -Bootstrap -Task Test  # первый раз: ставит psake/BuildHelpers/Pester/PSScriptAnalyzer/platyPS
+# Windows PowerShell 5.1 (как в проде), из корня репозитория:
+.\build.ps1 -Task Test        # компиляция + PSScriptAnalyzer + Pester (нужны psake, BuildHelpers, Pester 4.10.1, PSScriptAnalyzer, platyPS)
+.\build.ps1 -Task Build       # только сборка в out\PoshBot\<ModuleVersion>
+.\build.ps1 -Bootstrap -Task Test   # первый раз на чистой машине: ставит зависимости из requirements.psd1
 ```
 
 - Модуль **компилируется в один `PoshBot.psm1`**. Порядок классов задан **вручную** в `psakeFile.ps1` (task `Compile`). Новый файл в `Classes/` нужно добавить в этот список в правильном месте (после классов, от которых он зависит), иначе модуль не загрузится.
 - `Implementations/**/*.ps1` дописываются в конец psm1 автоматически (кроме `*ServiceBusReceiver*`).
 - `Compile` начинается с `Clean`, который **очищает `out/PoshBot/<ModuleVersion>`**. Перед сборкой релиза поднимайте `ModuleVersion` в `PoshBot/PoshBot.psd1`, чтобы не перезаписать задеплоенную версию.
 - Деплой: скопировать `out/PoshBot/<ver>` в `FUIB/ospbot/Modules/PoshBot/<ver>` и поправить путь импорта в `PoshBot-Slack-Prod.ps1`.
+- Тесты (`Tests/`) написаны на синтаксисе Pester 3/4 (`Should Be`), поэтому build использует **Pester 4.10.1**. Pester 3.4.0 (был прибит ранее) падает на текущем Windows PowerShell; Pester 5/6 потребует переписать тесты (`Should -Be`, `BeforeAll`, `InModuleScope`).
+- `build.ps1` перед сборкой импортирует PSSlackAG (см. §4, п.8); параметр `-PSSlackPath` переопределяет путь.
 - Быстрая проверка синтаксиса отдельного файла: `[System.Management.Automation.Language.Parser]::ParseFile(...)` — ошибки вида «Unable to find type [Backend]» нормальны (типы определены в других файлах).
 - Код должен работать в **Windows PowerShell 5.1** (прод) и PowerShell 7. Не использовать синтаксис только 7.x (`??`, `?.`, тернарный оператор, `ForEach-Object -Parallel`) в ядре.
 
@@ -96,7 +100,7 @@
 5. **Slash-команды** приходят без `ts`: реакции и `-TH` для них не работают (это ожидаемо). `/cmd` превращается в `!cmd <text>`.
 6. `as_user` — legacy-параметр «только для classic apps». Текущие PSSlack-вызовы передают `-AsUser` и это работает, но в новом коде его не использовать.
 7. Текст ≤ ~4000 символов на сообщение (бекенд режет по 3900 по строкам — `_ChunkString`).
-8. PSSlack `Send-SlackApi` шлёт параметры **GET-строкой запроса**. Для длинных/кириллических текстов предпочтительнее POST JSON через `SlackClient._SendAPI()` (кандидат на рефакторинг).
+8. **PSSlack = ваш форк `PSSlackAG 1.0.6a`** (`..\..\FUIB\ospbot\Modules\PSSlackAG\1.0.6a\PSSlack.psd1`, внутри — модуль `PSSlack` версии 1.0.6). От оригинала 1.0.6 отличается только `Get-SlackUser` (пагинация, `limit=999`). Прод импортирует его по пути; папка не совпадает с именем манифеста, поэтому через `PSModulePath` он не находится. Сборка и тесты тоже грузят его (`build.ps1 -PSSlackPath`). Используемые бекендом `Send-SlackMessage -Thread`, `New-SlackMessage -Thread`, `Send-SlackApi` в форке идентичны оригиналу.
 
 Токены: `Token` = `xoxb-…` (bot, все Web API вызовы), `TokenApp` = `xapp-…` (только `apps.connections.open`).
 

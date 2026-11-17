@@ -466,7 +466,6 @@ class SlackAppSMBackend : Backend {
                 '(.*?)PoshBot\.File\.Upload' {
                     $this.LogDebug('Custom response is [PoshBot.File.Upload]')
 
-                    $token = $this.Connection.Config.Credential.GetNetworkCredential().Password
                     $filePath = $null
                     $isTempFile = $false
                     $title = $null

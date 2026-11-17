@@ -6,6 +6,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](http://keepachangelog.com/)
 and this project adheres to [Semantic Versioning](http://semver.org/).
 
+## [0.14.34] 2026-11-17
+
+### Fixed
+
+- SlackAppSM: replies are posted into the thread of the calling message. `thread_ts` is no longer prefixed with `@` (Slack ignored it and posted to the channel), the parent `thread_ts` is used when the command was written inside a thread, and every reply (cards, text, plain output, errors) follows the thread.
+- SlackAppSM: `-DM` responses use the user ID as the channel instead of the deprecated `@username`; file uploads to DM open the conversation via `conversations.open`.
+- SlackAppSM: file upload (`files.getUploadURLExternal` / `files.completeUploadExternal`) now supports `thread_ts`, `-Content`, checks `ok` on every step, reports failures to the user and removes temporary files.
+- SlackAppSM Socket Mode: acknowledge only envelopes that have an `envelope_id`, handle `hello`, `disconnect` (reconnect) and `interactive` envelopes, fixed `KeepAliveInterval` (was 5 ticks instead of 5 seconds).
+- `New-PoshBotCardResponse`: `DM` and `TH` are stored as booleans (were `$null`/switch objects that did not survive the job boundary).
+- Scheduled commands no longer reply into the thread of the message that created the schedule.
+- Build: Pester task runs tests in a separate process and uses Pester 4.10.1 (3.4.0 does not work on current Windows PowerShell); PSScriptAnalyzer rule `PSProvideCommentHelp` excluded (crashes inside psake).
+
+### Added
+
+- `-TH` parameter for `New-PoshBotFileUpload`.
+- `build.ps1 -PSSlackPath` - builds and tests against the customized PSSlack (PSSlackAG 1.0.6a).
+- `CLAUDE.md` and `docs/architecture/bot-core-spec.md` (core specification for a .NET implementation).
+
 ## [0.14.0] Unreleased
 
 ### Fixed

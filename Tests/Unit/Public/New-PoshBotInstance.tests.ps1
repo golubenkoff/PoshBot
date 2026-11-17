@@ -8,7 +8,7 @@ Describe 'New-PoshBotInstance' {
         }
         $script:psd1    = Get-Item -Path (Join-Path -Path $PSScriptRoot -ChildPath '..\..\Artifacts\Cherry2000.psd1')
         $script:backend = New-PoshBotSlackBackend -Configuration @{Token = (New-Guid).ToString(); Name = 'Test-Backend'}
-        $script:bot     = New-PoshBotInstance -Path $psd1 -Backend $script:backend -WarningAction Ignore
+        $script:bot     = New-PoshBotInstance -Path $psd1 -Backend $script:backend -WarningAction SilentlyContinue
     }
 
     AfterAll {
@@ -22,7 +22,7 @@ Describe 'New-PoshBotInstance' {
         }
 
         it 'Accepts paths from pipeline' {
-            $script:bot = $script:psd1 | New-PoshBotInstance -Backend $script:backend -WarningAction Ignore
+            $script:bot = $script:psd1 | New-PoshBotInstance -Backend $script:backend -WarningAction SilentlyContinue
             $script:bot | Should -Not -BeNullOrEmpty
             $script:bot.PSObject.TypeNames[0] | Should -Be 'Bot'
         }
@@ -34,7 +34,7 @@ Describe 'New-PoshBotInstance' {
 
     Context 'LiteralPath' {
         it 'Accepts LiteralPath' {
-            $config = New-PoshBotInstance -LiteralPath $script:psd1 -Backend $script:backend -WarningAction Ignore
+            $config = New-PoshBotInstance -LiteralPath $script:psd1 -Backend $script:backend -WarningAction SilentlyContinue
             $config | Should -Not -BeNullOrEmpty
         }
     }
@@ -42,12 +42,12 @@ Describe 'New-PoshBotInstance' {
     Context 'Configuration' {
         it 'Accepts configuration object' {
             $config = $script:psd1 | Get-PoshBotConfiguration
-            {$script:bot = New-PoshBotInstance -Configuration $config -Backend $script:backend -WarningAction Ignore} | Should -Not -Throw
+            {$script:bot = New-PoshBotInstance -Configuration $config -Backend $script:backend -WarningAction SilentlyContinue} | Should -Not -Throw
         }
 
         it 'Accepts configuration object from pipeline' {
             $config = $script:psd1 | Get-PoshBotConfiguration
-            {$script:bot = $config | New-PoshBotInstance -Backend $script:backend -WarningAction Ignore} | Should -Not -Throw
+            {$script:bot = $config | New-PoshBotInstance -Backend $script:backend -WarningAction SilentlyContinue} | Should -Not -Throw
         }
     }
 }

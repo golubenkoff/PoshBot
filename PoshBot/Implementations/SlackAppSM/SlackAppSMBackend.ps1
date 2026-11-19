@@ -217,6 +217,26 @@ class SlackAppSMBackend : Backend {
                     continue
                 }
 
+                # 'message_changed' is sent not only for real edits but also when Slack updates an existing
+                # message (unfurled links, reply counters after the bot answers in a thread, ...).
+                # The event carries the ORIGINAL text/user, so the same command would run a second time,
+                # and its own 'ts' is the event ts (not the message ts), so a reply would land in the channel.
+                # Ignore it unless the text really changed (a genuine edit), and then use the edited message's ts.
+                if ($slackMessage.subtype -eq 'message_changed') {
+                    $newText = [string]$slackMessage.message.text
+                    $oldText = [string]$slackMessage.previous_message.text
+                    if ($newText -eq $oldText) {
+                        $this.LogDebug('SubType is [message_changed] and text is unchanged (unfurl / thread update). Ignoring')
+                        continue
+                    }
+                    if ($slackMessage.message.ts) {
+                        $slackMessage | Add-Member -NotePropertyName ts -NotePropertyValue $slackMessage.message.ts -Force
+                    }
+                    if ($slackMessage.message.thread_ts) {
+                        $slackMessage | Add-Member -NotePropertyName thread_ts -NotePropertyValue $slackMessage.message.thread_ts -Force
+                    }
+                }
+
                 # We only care about certain message types from Slack
                 if ($slackMessage.Type -in $this.MessageTypes) {
                     $msg = [Message]::new()
@@ -646,9 +666,14 @@ class SlackAppSMBackend : Backend {
                 timestamp = $Message.RawMessage.ts
             }
             $this.LogDebug("Adding reaction [$emoji] to message Id [$($Message.RawMessage.ts)]")
-            $resp = Send-SlackApi -Token $this.Connection.Config.Credential.GetNetworkCredential().Password -Method 'reactions.add' -Body $body -Verbose:$false
-            if (-not $resp.ok) {
-                $this.LogInfo([LogSeverity]::Error, 'Error adding reaction to message', $resp)
+            try {
+                $resp = Send-SlackApi -Token $this.Connection.Config.Credential.GetNetworkCredential().Password -Method 'reactions.add' -Body $body -Verbose:$false -ErrorAction Stop
+                if (-not $resp.ok) {
+                    $this.LogInfo([LogSeverity]::Error, 'Error adding reaction to message', $resp)
+                }
+            } catch {
+                # Slack error code (message_not_found, already_reacted, missing_scope ...) + what we tried to react to
+                $this.LogInfo([LogSeverity]::Error, 'Error adding reaction to message', @{ Error = $_.Exception.Message; Channel = $Message.To; Timestamp = $Message.RawMessage.ts; Emoji = $emoji })
             }
         }
     }
@@ -668,9 +693,14 @@ class SlackAppSMBackend : Backend {
                 timestamp = $Message.RawMessage.ts
             }
             $this.LogDebug("Removing reaction [$emoji] from message Id [$($Message.RawMessage.ts)]")
-            $resp = Send-SlackApi -Token $this.Connection.Config.Credential.GetNetworkCredential().Password -Method 'reactions.remove' -Body $body -Verbose:$false
-            if (-not $resp.ok) {
-                $this.LogInfo([LogSeverity]::Error, 'Error removing reaction from message', $resp)
+            try {
+                $resp = Send-SlackApi -Token $this.Connection.Config.Credential.GetNetworkCredential().Password -Method 'reactions.remove' -Body $body -Verbose:$false -ErrorAction Stop
+                if (-not $resp.ok) {
+                    $this.LogInfo([LogSeverity]::Error, 'Error removing reaction from message', $resp)
+                }
+            } catch {
+                # Slack error code (message_not_found, already_reacted, missing_scope ...) + what we tried to react to
+                $this.LogInfo([LogSeverity]::Error, 'Error removing reaction from message', @{ Error = $_.Exception.Message; Channel = $Message.To; Timestamp = $Message.RawMessage.ts; Emoji = $emoji })
             }
         }
     }

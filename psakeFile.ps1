@@ -37,7 +37,18 @@ task Init {
 task Test -Depends Init, Analyze, Pester -description 'Run test suite'
 
 task Analyze -Depends Build {
-    $analysis = Invoke-ScriptAnalyzer -Path $outputModVerDir -Settings ./ScriptAnalyzerSettings.psd1 -Verbose:$false
+    # PSScriptAnalyzer (1.21+) intermittently crashes with internal errors (NullReference, "parameter 'Function'") on the
+    # big compiled psm1 because it runs rules in parallel. The same run succeeds on retry, so retry before failing the build.
+    $analysis = $null
+    foreach ($attempt in 1..3) {
+        try {
+            $analysis = Invoke-ScriptAnalyzer -Path $outputModVerDir -Settings ./ScriptAnalyzerSettings.psd1 -Verbose:$false -ErrorAction Stop
+            break
+        } catch {
+            if ($attempt -eq 3) { throw }
+            Write-Warning "PSScriptAnalyzer crashed (attempt $attempt of 3): $($_.Exception.Message). Retrying..."
+        }
+    }
     $errors   = $analysis | Where-Object {$_.Severity -eq 'Error'}
     $warnings = $analysis | Where-Object {$_.Severity -eq 'Warning'}
 

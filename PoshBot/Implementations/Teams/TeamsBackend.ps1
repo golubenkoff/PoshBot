@@ -20,6 +20,20 @@ class TeamsBackend : Backend {
 
     [hashtable]$FileUploadTracker = @{}
 
+    # A cache miss reloads the user list at most once per this interval (a reload blocks the bot loop)
+    [int]$UserReloadMinIntervalSeconds = 60
+    [int]$RoomReloadMinIntervalSeconds = 60
+    [int]$UnknownRoomTtlMinutes = 10
+    hidden [datetime]$_LastUserLoad = [datetime]::MinValue
+    hidden [datetime]$_LastRoomLoad = [datetime]::MinValue
+
+    # Users we learned from incoming messages (not in the bulk member list). Persisted to LearnedTeamsUsers.xml
+    hidden [hashtable]$_LearnedUsers = @{}
+    hidden [bool]$_LearnedUsersLoaded = $false
+
+    # Conversation IDs that are not channels of the team (bot id, personal chats ...): id -> when we last failed to resolve it
+    hidden [hashtable]$_UnknownRooms = @{}
+
     TeamsBackend([TeamsConnectionConfig]$Config) {
         $conn = [TeamsConnection]::new($Config)
         $this.TeamId = $Config.TeamId
@@ -84,6 +98,14 @@ class TeamsBackend : Backend {
                             if ($teamsMessage.from) {
                                 $msg.From = $teamsMessage.from.id
                                 $msg.FromName = $teamsMessage.from.name
+
+                                # The sender may be missing from the bulk member list (guest, new employee, other tenant).
+                                # Learn them from the message itself so commands still get a usable CallingUserInfo.
+                                try {
+                                    $this._EnsureUser($teamsMessage)
+                                } catch {
+                                    $this.LogInfo([LogSeverity]::Warning, "Unable to register user [$($teamsMessage.from.id)]", [ExceptionFormatter]::Summarize($_))
+                                }
                             }
 
                             # Mark as DM
@@ -116,7 +138,7 @@ class TeamsBackend : Backend {
                 }
             }
         } catch {
-            $this.LogInfo([LogSeverity]::Error, 'Error authenticating to Teams', [ExceptionFormatter]::Summarize($_))
+            $this.LogInfo([LogSeverity]::Error, 'Error receiving messages from Teams', [ExceptionFormatter]::Summarize($_))
         }
 
         return $messages
@@ -535,118 +557,289 @@ class TeamsBackend : Backend {
         # NOT IMPLEMENTED YET
     }
 
-    # Populate the list of users the team
-    [void]LoadUsers() {
-        if (-not [string]::IsNullOrEmpty($this.ServiceUrl)) {
-            $this.LogInfo('Getting Teams users')
+    # Directory with the Teams cache files (offline member list, learned users)
+    hidden [string]_TeamsDir() {
+        $dir = Join-Path -Path $env:USERPROFILE -ChildPath '.poshbot.teams'
+        if (-not (Test-Path -Path $dir)) {
+            New-Item -Path $dir -ItemType Directory -Force > $null
+        }
+        return $dir
+    }
 
-            #Load Members from Teams
-            $uri = "$($this.ServiceUrl)v3/conversations/$($this.TeamId)/pagedmembers?pageSize=500"
-            $headers = @{
-                Authorization = "Bearer $($this.Connection._AccessTokenInfo.access_token)"
-            }
+    # Write a clixml file atomically (temp file + rename) so a crash never leaves a half-written cache
+    hidden [void]_SaveClixml([object]$Data, [string]$Path) {
+        $tmp = "$Path.tmp"
+        $Data | Export-Clixml -Path $tmp -Force
+        Move-Item -Path $tmp -Destination $Path -Force
+    }
 
-            #Load Members from Cached File
+    # Build a TeamsPerson from a member record (Bot Framework member / learned user)
+    hidden [TeamsPerson]_NewPerson([object]$Member) {
+        $user = [TeamsPerson]::new()
+        $user.Id = $Member.id
+        $user.FirstName = $Member.givenName
+        $user.LastName = $Member.surname
+        $user.UserPrincipalName = $Member.userPrincipalName
+        $user.Email = $Member.email
+        $user.FullName = ("$($Member.givenName) $($Member.surname)").Trim()
+        if ([string]::IsNullOrEmpty($user.FullName)) { $user.FullName = $Member.name }
+        if (-not [string]::IsNullOrEmpty($Member.userPrincipalName)) {
+            $user.NickName = $Member.userPrincipalName
+        } elseif (-not [string]::IsNullOrEmpty($Member.email)) {
+            $user.NickName = $Member.email
+        } else {
+            $user.NickName = $Member.name
+        }
+        return $user
+    }
 
-            $poshBotDirTeams = Join-Path -Path $env:USERPROFILE -ChildPath '.poshbot.teams'
-            $OfflineTeamsUsersFileName = 'OfflineTeamsUsers.xml'
-            $offlineTeamsUsersFile = Join-Path $poshBotDirTeams $OfflineTeamsUsersFileName
-
-            if ((Test-Path $offlineTeamsUsersFile  ) -and ((Get-ChildItem $offlineTeamsUsersFile).LastWriteTime -gt $(Get-Date).AddDays(-7)) -and ((Get-ChildItem $offlineTeamsUsersFile).Length -gt 1024)) {
-                #if (Test-Path $offlineTeamsUsersFile  ) {
-                $this.LogInfo('[Teams] Getting Users (XML) - OFFLINE')
-                $members = @()
-                $members = Import-Clixml $offlineTeamsUsersFile
-            } else {
-                $this.LogInfo('[Teams] Getting Users (Teams) - Online')
-
-                $members = @()
-                do {
-                    $Results = ''
-                    $StatusCode = ''
-                    do {
-                        try {
-                            $Results = Invoke-RestMethod -Headers $headers -Uri $Uri -UseBasicParsing -Method 'GET' -ContentType 'application/json'
-
-                            $StatusCode = $Results.StatusCode
-                        } catch {
-                            $StatusCode = $_.Exception.Response.StatusCode.value__
-
-                            if ($StatusCode -eq 429) {
-                                $this.LogDebug('Got throttled by Microsoft. Sleeping for 45 seconds...')
-                                Start-Sleep -Seconds 45
-                            } else {
-                                $this.LogDebug("Error Populating the list of users for the team: $($_.Exception.Message)")
-                            }
-                        }
-                    } while ($StatusCode -eq 429)
-                    if ($Results.continuationToken) {
-                        $uri = "$($this.ServiceUrl)v3/conversations/$($this.TeamId)/pagedmembers?pageSize=500&continuationToken=$($Results.continuationToken)"
-                        $members += $Results.members
-                    } else {
-                        $members += $Results.members
+    # Read all team members from Teams. Returns $null when anything fails, so a partial list is never used or cached
+    hidden [object[]]_FetchAllMembers() {
+        $uri = "$($this.ServiceUrl)v3/conversations/$($this.TeamId)/pagedmembers?pageSize=500"
+        $headers = @{ Authorization = "Bearer $($this.Connection._AccessTokenInfo.access_token)" }
+        $all = [Collections.Generic.List[object]]::new()
+        while ($true) {
+            $page = $null
+            $throttled = 0
+            while ($null -eq $page) {
+                try {
+                    $page = Invoke-RestMethod -Headers $headers -Uri $uri -UseBasicParsing -Method 'GET' -ContentType 'application/json' -ErrorAction Stop
+                } catch {
+                    $code = $null
+                    try { $code = $_.Exception.Response.StatusCode.value__ } catch { $code = $null }
+                    if ($code -eq 429 -and $throttled -lt 10) {
+                        $throttled++
+                        $this.LogInfo([LogSeverity]::Warning, "Got throttled by Microsoft ($throttled). Sleeping for 45 seconds...")
+                        Start-Sleep -Seconds 45
+                        continue
                     }
-                } while ($Results.continuationToken)
-
-                $members | Export-Clixml $offlineTeamsUsersFile
-            }
-
-            $this.LogInfo('[Teams] Users: ' + $members.count)
-            $this.LogDebug('Finished getting Teams users')
-
-            $members | ForEach-Object {
-                $user = [TeamsPerson]::new()
-                $user.Id = $_.id
-                $user.FirstName = $_.givenName
-                $user.LastName = $_.surname
-                $user.NickName = $_.userPrincipalName
-                $user.FullName = "$($_.givenName) $($_.surname)"
-                $user.Email = $_.email
-                $user.UserPrincipalName = $_.userPrincipalName
-
-                if (-not $this.Users.ContainsKey($_.ID)) {
-                    $this.LogDebug("Adding user [$($_.ID):$($_.Name)]")
-                    $this.Users[$_.ID] = $user
+                    $this.LogInfo([LogSeverity]::Error, 'Error getting the list of Teams users. The list will NOT be cached', @{ StatusCode = $code; Error = $_.Exception.Message; LoadedSoFar = $all.Count })
+                    return $null
                 }
             }
+            if ($page.members) { $all.AddRange([object[]]@($page.members)) }
+            if ($page.continuationToken) {
+                $uri = "$($this.ServiceUrl)v3/conversations/$($this.TeamId)/pagedmembers?pageSize=500&continuationToken=$([uri]::EscapeDataString($page.continuationToken))"
+            } else {
+                break
+            }
+        }
+        if ($all.Count -eq 0) {
+            $this.LogInfo([LogSeverity]::Error, 'Teams returned an empty list of users. The list will NOT be cached')
+            return $null
+        }
+        return $all.ToArray()
+    }
 
-            foreach ($key in $this.Users.Keys) {
-                if ($key -notin $members.ID) {
-                    $this.LogDebug("Removing outdated user [$key]")
-                    $this.Users.Remove($key)
+    hidden [void]_LoadLearnedUsers() {
+        $file = Join-Path -Path $this._TeamsDir() -ChildPath 'LearnedTeamsUsers.xml'
+        $this._LearnedUsersLoaded = $true
+        if (Test-Path -Path $file) {
+            try {
+                foreach ($rec in @(Import-Clixml -Path $file)) {
+                    if ($rec.id -and -not $this._LearnedUsers.ContainsKey($rec.id)) {
+                        $this._LearnedUsers[$rec.id] = $rec
+                    }
                 }
+                $this.LogInfo("[Teams] Learned users loaded: $($this._LearnedUsers.Count)")
+            } catch {
+                $this.LogInfo([LogSeverity]::Warning, "Unable to read [$file]", [ExceptionFormatter]::Summarize($_))
             }
         }
     }
 
+    hidden [void]_SaveLearnedUsers() {
+        $file = Join-Path -Path $this._TeamsDir() -ChildPath 'LearnedTeamsUsers.xml'
+        try {
+            $this._SaveClixml(@($this._LearnedUsers.Values), $file)
+        } catch {
+            $this.LogInfo([LogSeverity]::Warning, "Unable to save [$file]", [ExceptionFormatter]::Summarize($_))
+        }
+    }
+
+    # Make sure the sender of a message is a known user. If not, get their profile from the conversation
+    # (GET v3/conversations/{id}/members/{userId}) or, failing that, from the message itself, and remember them
+    hidden [void]_EnsureUser([pscustomobject]$Activity) {
+        $from = $Activity.from
+        if (-not $from -or [string]::IsNullOrEmpty($from.id)) { return }
+        if (-not $this._LearnedUsersLoaded) { $this._LoadLearnedUsers() }
+
+        $known = $this.Users[$from.id]
+        if ($known) {
+            # Learned earlier without an e-mail/UPN? Retry the profile lookup, but not more often than every 10 minutes
+            $rec = $this._LearnedUsers[$from.id]
+            $hasContact = (-not [string]::IsNullOrEmpty($known.Email)) -or (-not [string]::IsNullOrEmpty($known.UserPrincipalName))
+            if ($hasContact -or -not $rec -or (([datetime]::UtcNow - [datetime]$rec.lastTry).TotalMinutes -lt 10)) { return }
+        }
+
+        $info = $null
+        $source = 'message'
+        try {
+            $baseUrl = $Activity.serviceUrl
+            if ([string]::IsNullOrEmpty($baseUrl)) { $baseUrl = $this.ServiceUrl }
+            $url = "$($baseUrl)v3/conversations/$([uri]::EscapeDataString($Activity.conversation.id))/members/$([uri]::EscapeDataString($from.id))"
+            $headers = @{ Authorization = "Bearer $($this.Connection._AccessTokenInfo.access_token)" }
+            $info = Invoke-RestMethod -Uri $url -Headers $headers -Method 'GET' -ContentType 'application/json' -TimeoutSec 15 -ErrorAction Stop
+            $source = 'member-api'
+        } catch {
+            $this.LogInfo([LogSeverity]::Warning, "Unable to get the profile of user [$($from.id)] from Teams. Using data from the message", @{ Error = $_.Exception.Message })
+        }
+
+        $learnedAt = [datetime]::UtcNow
+        if ($this._LearnedUsers[$from.id]) { $learnedAt = $this._LearnedUsers[$from.id].learnedAt }
+        $name = $from.name
+        if ($info.name) { $name = $info.name }
+        $aad = $from.aadObjectId
+        if ($info.aadObjectId) { $aad = $info.aadObjectId }
+
+        $rec = [pscustomobject]@{
+            id                = $from.id
+            name              = $name
+            givenName         = $info.givenName
+            surname           = $info.surname
+            email             = $info.email
+            userPrincipalName = $info.userPrincipalName
+            aadObjectId       = $aad
+            tenantId          = $info.tenantId
+            source            = $source
+            learnedAt         = $learnedAt
+            lastTry           = [datetime]::UtcNow
+        }
+        $this._LearnedUsers[$from.id] = $rec
+        $this.Users[$from.id] = $this._NewPerson($rec)
+        $this._SaveLearnedUsers()
+        $this.LogInfo("[Teams] Learned user [$($rec.id)] ($($rec.name)) from [$source]")
+    }
+
+    # Reload users after a cache miss, but not more often than UserReloadMinIntervalSeconds
+    hidden [bool]_ReloadUsersThrottled() {
+        $age = ([datetime]::UtcNow - $this._LastUserLoad).TotalSeconds
+        if ($age -lt $this.UserReloadMinIntervalSeconds) {
+            $this.LogDebug("Users were refreshed [$([int]$age)] s ago. Not reloading again yet")
+            return $false
+        }
+        $this.LoadUsers()
+        return $true
+    }
+
+    # Populate the list of users the team.
+    # Source: OfflineTeamsUsers.xml when it is younger than 7 days, otherwise Teams (paged). Plus users learned from messages.
+    [void]LoadUsers() {
+        if ([string]::IsNullOrEmpty($this.ServiceUrl)) { return }
+
+        $this._LastUserLoad = [datetime]::UtcNow
+        $this.LogInfo('Getting Teams users')
+
+        $offlineFile = Join-Path -Path $this._TeamsDir() -ChildPath 'OfflineTeamsUsers.xml'
+        $members = $null
+        $fromTeams = $false
+
+        $cacheOk = $false
+        if (Test-Path -Path $offlineFile) {
+            $fi = Get-Item -Path $offlineFile
+            $cacheOk = ($fi.Length -gt 1024) -and ($fi.LastWriteTime -gt (Get-Date).AddDays(-7))
+        }
+
+        if ($cacheOk) {
+            $this.LogInfo('[Teams] Getting Users (XML) - OFFLINE')
+            try {
+                $members = @(Import-Clixml -Path $offlineFile)
+            } catch {
+                $this.LogInfo([LogSeverity]::Warning, "Unable to read [$offlineFile]. Falling back to Teams", [ExceptionFormatter]::Summarize($_))
+                $members = $null
+            }
+        }
+
+        if ($null -eq $members) {
+            $this.LogInfo('[Teams] Getting Users (Teams) - Online')
+            $members = $this._FetchAllMembers()
+            if ($null -ne $members) {
+                $fromTeams = $true
+                try {
+                    $this._SaveClixml($members, $offlineFile)
+                } catch {
+                    $this.LogInfo([LogSeverity]::Warning, "Unable to write [$offlineFile]", [ExceptionFormatter]::Summarize($_))
+                }
+            } elseif (Test-Path -Path $offlineFile) {
+                # Online refresh failed: an old list is better than none
+                $this.LogInfo([LogSeverity]::Warning, '[Teams] Using the OLD offline list of users')
+                try { $members = @(Import-Clixml -Path $offlineFile) } catch { $members = $null }
+            }
+        }
+
+        if ($null -eq $members) {
+            $this.LogInfo([LogSeverity]::Error, '[Teams] No list of users available. Keeping the users we already know')
+            return
+        }
+
+        $this.LogInfo('[Teams] Users: ' + @($members).Count)
+
+        # Add new users (a freshly downloaded list also refreshes the existing ones)
+        $memberIds = [Collections.Generic.HashSet[string]]::new()
+        foreach ($m in $members) {
+            if ([string]::IsNullOrEmpty($m.id)) { continue }
+            [void]$memberIds.Add([string]$m.id)
+            if ($fromTeams -or -not $this.Users.ContainsKey($m.id)) {
+                $this.Users[$m.id] = $this._NewPerson($m)
+            }
+        }
+
+        # Users learned from messages: keep them, add the missing ones, forget those that are now in the member list
+        if (-not $this._LearnedUsersLoaded) { $this._LoadLearnedUsers() }
+        $changed = $false
+        foreach ($id in @($this._LearnedUsers.Keys)) {
+            if ($memberIds.Contains($id)) {
+                $this._LearnedUsers.Remove($id)
+                $changed = $true
+            } elseif (-not $this.Users.ContainsKey($id)) {
+                $this.Users[$id] = $this._NewPerson($this._LearnedUsers[$id])
+            }
+        }
+        if ($changed) { $this._SaveLearnedUsers() }
+
+        # Remove users that are neither in the member list nor learned (HashSet lookup, iterate over a copy)
+        foreach ($key in @($this.Users.Keys)) {
+            if (-not $memberIds.Contains($key) -and -not $this._LearnedUsers.ContainsKey($key)) {
+                $this.LogDebug("Removing outdated user [$key]")
+                $this.Users.Remove($key)
+            }
+        }
+        $this.LogDebug('Finished getting Teams users')
+    }
+
     # Populate the list of channels in the team
     [void]LoadRooms() {
-        #if (-not [string]::IsNullOrEmpty($this.TeamId)) {
+        $this._LastRoomLoad = [datetime]::UtcNow
         $this.LogDebug('Getting Teams channels')
 
         $uri = "$($this.ServiceUrl)v3/teams/$($this.TeamId)/conversations"
         $headers = @{
             Authorization = "Bearer $($this.Connection._AccessTokenInfo.access_token)"
         }
-        $channels = Invoke-RestMethod -Uri $uri -Headers $headers
+        try {
+            $channels = Invoke-RestMethod -Uri $uri -Headers $headers -ErrorAction Stop
+        } catch {
+            $this.LogInfo([LogSeverity]::Warning, 'Unable to get the list of Teams channels', [ExceptionFormatter]::Summarize($_))
+            return
+        }
 
         if ($channels.conversations) {
-            $channels.conversations | ForEach-Object {
+            $ids = [Collections.Generic.HashSet[string]]::new()
+            foreach ($c in $channels.conversations) {
                 $channel = [TeamsChannel]::new()
-                $channel.Id = $_.id
-                $channel.Name = $_.name
-                $this.LogDebug("Adding channel: $($_.id):$($_.name)")
-                $this.Rooms[$_.id] = $channel
+                $channel.Id = $c.id
+                $channel.Name = $c.name
+                [void]$ids.Add([string]$c.id)
+                $this.Rooms[$c.id] = $channel
             }
 
-            foreach ($key in $this.Rooms.Keys) {
-                if ($key -notin $channels.conversations.ID) {
+            foreach ($key in @($this.Rooms.Keys)) {
+                if (-not $ids.Contains($key)) {
                     $this.LogDebug("Removing outdated channel [$key]")
                     $this.Rooms.Remove($key)
                 }
             }
         }
-        #}
     }
 
     [bool]MsgFromBot([string]$From) {
@@ -658,7 +851,7 @@ class TeamsBackend : Backend {
         $user = $this.Users[$UserId]
         if (-not $user) {
             $this.LogDebug([LogSeverity]::Warning, "User [$UserId] not found. Refreshing users")
-            $this.LoadUsers()
+            [void]$this._ReloadUsersThrottled()
             $user = $this.Users[$UserId]
         }
 
@@ -681,7 +874,7 @@ class TeamsBackend : Backend {
             # User each doesn't exist or is not in the local cache
             # Refresh it and try again
             $this.LogDebug([LogSeverity]::Warning, "User [$Username] not found. Refreshing users")
-            $this.LoadUsers()
+            [void]$this._ReloadUsersThrottled()
             $user = $this.Users.Values | Where-Object { $_.Nickname -eq $Username }
             if (-not $user) {
                 $id = $null
@@ -704,7 +897,7 @@ class TeamsBackend : Backend {
             $name = $this.Users[$UserId].Nickname
         } else {
             $this.LogDebug([LogSeverity]::Warning, "User [$UserId] not found. Refreshing users")
-            $this.LoadUsers()
+            [void]$this._ReloadUsersThrottled()
             $name = $this.Users[$UserId].Nickname
         }
         if ($name) {
@@ -715,15 +908,26 @@ class TeamsBackend : Backend {
         return $name
     }
 
-    # Get the channel name by Id
+    # Get the channel name by Id. IDs that are not team channels (the bot's own id, personal chats) are
+    # remembered for UnknownRoomTtlMinutes so they do not trigger a Teams call on every message
     [string]ChannelIdToName([string]$ChannelId) {
         $name = $null
         if ($this.Rooms.ContainsKey($ChannelId)) {
             $name = $this.Rooms[$ChannelId].Name
         } else {
-            $this.LogDebug([LogSeverity]::Warning, "Channel [$ChannelId] not found. Refreshing channels")
-            $this.LoadRooms()
-            $name = $this.Rooms[$ChannelId].Name
+            $unknownSince = $this._UnknownRooms[$ChannelId]
+            $isKnownUnknown = $unknownSince -and (([datetime]::UtcNow - [datetime]$unknownSince).TotalMinutes -lt $this.UnknownRoomTtlMinutes)
+            if (-not $isKnownUnknown) {
+                if (([datetime]::UtcNow - $this._LastRoomLoad).TotalSeconds -ge $this.RoomReloadMinIntervalSeconds) {
+                    $this.LogDebug([LogSeverity]::Warning, "Channel [$ChannelId] not found. Refreshing channels")
+                    $this.LoadRooms()
+                    if ($this.Rooms.ContainsKey($ChannelId)) {
+                        $name = $this.Rooms[$ChannelId].Name
+                    } else {
+                        $this._UnknownRooms[$ChannelId] = [datetime]::UtcNow
+                    }
+                }
+            }
         }
         if ($name) {
             $this.LogDebug("Resolved [$ChannelId] to [$name]")
@@ -758,7 +962,7 @@ class TeamsBackend : Backend {
             $user = $this.Users[$UserId]
         } else {
             $this.LogDebug([LogSeverity]::Warning, "User [$UserId] not found. Refreshing users")
-            $this.LoadUsers()
+            [void]$this._ReloadUsersThrottled()
             $user = $this.Users[$UserId]
         }
 

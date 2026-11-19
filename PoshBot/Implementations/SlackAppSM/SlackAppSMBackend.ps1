@@ -24,6 +24,14 @@ class SlackAppSMBackend : Backend {
     # Cache: user ID -> DM conversation ID (conversations.open)
     hidden [hashtable]$_DmChannelCache = @{}
 
+    # Reloading the full user list (users.list) is expensive (~10 s for thousands of users and it blocks the bot loop).
+    # A cache miss triggers a reload at most once per this interval.
+    [int]$UserReloadMinIntervalSeconds = 60
+    hidden [datetime]$_LastUserLoad = [datetime]::MinValue
+
+    # Channel IDs that conversations.info could not resolve (bot not a member / no access) - don't ask again every message
+    hidden [hashtable]$_UnknownRooms = @{}
+
     # Import some color defs.
     hidden [hashtable]$_PSSlackColorMap = @{
         aliceblue            = '#F0F8FF'
@@ -189,7 +197,8 @@ class SlackAppSMBackend : Backend {
         $this.Connection.Connect()
         $this.BotId = $this.GetBotIdentity()
         $this.LoadUsers()
-        $this.LoadRooms()
+        # Channels are NOT loaded here: conversations.list over all channels took ~140 s for ~900 channels.
+        # Channel names are resolved on demand (ChannelIdToName -> conversations.info) and cached.
     }
 
     # Receive a message from the websocket
@@ -710,9 +719,14 @@ class SlackAppSMBackend : Backend {
         if ($ChannelName -match '^#') {
             $ChannelName = $ChannelName.TrimStart('#')
         }
-        $channelId = ($this.Connection.LoginData.channels | Where-Object name -EQ $ChannelName).id
-        if (-not $ChannelId) {
-            $channelId = ($this.Connection.LoginData.channels | Where-Object id -EQ $ChannelName).id
+        $channelId = ($this.Rooms.Values | Where-Object Name -EQ $ChannelName).Id
+        if (-not $channelId -and $this.Rooms.Count -eq 0) {
+            # By-name lookup needs the full list (slow); done once, only when somebody really asks
+            $this.LoadRooms()
+            $channelId = ($this.Rooms.Values | Where-Object Name -EQ $ChannelName).Id
+        }
+        if (-not $channelId -and $this.Rooms.ContainsKey($ChannelName)) {
+            $channelId = $ChannelName
         }
         $this.LogDebug("Resolved channel [$ChannelName] to [$channelId]")
         return $channelId
@@ -721,6 +735,7 @@ class SlackAppSMBackend : Backend {
     # Populate the list of users the Slack team
     [void]LoadUsers() {
         $this.LogDebug('Getting Slack users')
+        $this._LastUserLoad = [datetime]::UtcNow
         $allUsers = Get-Slackuser -Token $this.Connection.Config.Credential.GetNetworkCredential().Password -Verbose:$false
 
         # $allUsers = Get-Slackuser -Token $token_bot -Verbose:$false
@@ -752,8 +767,10 @@ class SlackAppSMBackend : Backend {
             }
         }
 
-        foreach ($key in $this.Users.Keys) {
-            if ($key -notin $allUsers.ID) {
+        # HashSet lookup (was `-notin $allUsers.ID` = O(n^2)); iterate over a copy so Remove() is allowed
+        $currentIds = [Collections.Generic.HashSet[string]]::new([string[]]@($allUsers.ID))
+        foreach ($key in @($this.Users.Keys)) {
+            if (-not $currentIds.Contains($key)) {
                 $this.LogDebug("Removing outdated user [$key]")
                 $this.Users.Remove($key)
             }
@@ -790,8 +807,9 @@ class SlackAppSMBackend : Backend {
                 $this.Rooms[$_.ID] = $channel
             })
 
-        foreach ($key in $this.Rooms.Keys) {
-            if ($key -notin $allChannels.ID) {
+        $currentIds = [Collections.Generic.HashSet[string]]::new([string[]]@($allChannels.ID))
+        foreach ($key in @($this.Rooms.Keys)) {
+            if (-not $currentIds.Contains($key)) {
                 $this.LogDebug("Removing outdated channel [$key]")
                 $this.Rooms.Remove($key)
             }
@@ -816,12 +834,23 @@ class SlackAppSMBackend : Backend {
         return $fromBot
     }
 
+    # Reload users after a cache miss, but not more often than UserReloadMinIntervalSeconds
+    hidden [bool]_ReloadUsersThrottled() {
+        $age = ([datetime]::UtcNow - $this._LastUserLoad).TotalSeconds
+        if ($age -lt $this.UserReloadMinIntervalSeconds) {
+            $this.LogDebug("Users were refreshed [$([int]$age)] s ago. Not reloading again yet")
+            return $false
+        }
+        $this.LoadUsers()
+        return $true
+    }
+
     # Get a user by their Id
     [SlackPerson]GetUser([string]$UserId) {
         $user = $this.Users[$UserId]
         if (-not $user) {
             $this.LogDebug([LogSeverity]::Warning, "User [$UserId] not found. Refreshing users")
-            $this.LoadUsers()
+            [void]$this._ReloadUsersThrottled()
             $user = $this.Users[$UserId]
         }
 
@@ -836,6 +865,13 @@ class SlackAppSMBackend : Backend {
     # Get a user Id by their name
     [string]UsernameToUserId([string]$Username) {
         $Username = $Username.TrimStart('@')
+
+        # Already an ID (e.g. BotAdmins = 'U5SA7DLJE')? Accept it if we know the user.
+        if ($Username -match '^[UW][A-Z0-9]{6,}$' -and $this.Users.ContainsKey($Username)) {
+            $this.LogDebug("[$Username] is a known user ID")
+            return $Username
+        }
+
         $user = $this.Users.Values | Where-Object { $_.Nickname -eq $Username }
         $id = $null
         if ($user) {
@@ -844,7 +880,7 @@ class SlackAppSMBackend : Backend {
             # User each doesn't exist or is not in the local cache
             # Refresh it and try again
             $this.LogDebug([LogSeverity]::Warning, "User [$Username] not found. Refreshing users")
-            $this.LoadUsers()
+            [void]$this._ReloadUsersThrottled()
             $user = $this.Users.Values | Where-Object { $_.Nickname -eq $Username }
             if (-not $user) {
                 $id = $null
@@ -867,7 +903,7 @@ class SlackAppSMBackend : Backend {
             $name = $this.Users[$UserId].Nickname
         } else {
             $this.LogDebug([LogSeverity]::Warning, "User [$UserId] not found. Refreshing users")
-            $this.LoadUsers()
+            [void]$this._ReloadUsersThrottled()
             $name = $this.Users[$UserId].Nickname
         }
         if ($name) {
@@ -878,15 +914,35 @@ class SlackAppSMBackend : Backend {
         return $name
     }
 
-    # Get the channel name by Id
+    # Get the channel name by Id. Resolved lazily with conversations.info and cached in Rooms
     [string]ChannelIdToName([string]$ChannelId) {
         $name = $null
         if ($this.Rooms.ContainsKey($ChannelId)) {
             $name = $this.Rooms[$ChannelId].Name
-        } else {
-            $this.LogDebug([LogSeverity]::Warning, "Channel [$ChannelId] not found. Refreshing channels")
-            $this.LoadRooms()
-            $name = $this.Rooms[$ChannelId].Name
+        } elseif (-not $this._UnknownRooms.ContainsKey($ChannelId)) {
+            $this.LogDebug("Channel [$ChannelId] not in cache. Asking Slack (conversations.info)")
+            try {
+                $resp = Send-SlackApi -Token $this.Connection.Config.Credential.GetNetworkCredential().Password -Method 'conversations.info' -Body @{ channel = $ChannelId } -Verbose:$false -ErrorAction Stop
+                if ($resp.ok -and $resp.channel) {
+                    $c = $resp.channel
+                    $channel = [SlackChannel]::new()
+                    $channel.Id = $c.id
+                    $channel.Name = $c.name
+                    $channel.Topic = $c.topic.value
+                    $channel.Purpose = $c.purpose.value
+                    $channel.Creator = $c.creator
+                    $channel.IsArchived = [bool]$c.is_archived
+                    $channel.IsGeneral = [bool]$c.is_general
+                    if ($c.num_members) { $channel.MemberCount = [int]$c.num_members }
+                    $this.Rooms[$c.id] = $channel
+                    $name = $c.name
+                }
+            } catch {
+                $this.LogInfo([LogSeverity]::Warning, "conversations.info failed for channel [$ChannelId]", @{ Error = $_.Exception.Message })
+            }
+            if (-not $name) {
+                $this._UnknownRooms[$ChannelId] = $true
+            }
         }
         if ($name) {
             $this.LogDebug("Resolved [$ChannelId] to [$name]")
@@ -922,7 +978,7 @@ class SlackAppSMBackend : Backend {
             $user = $this.Users[$UserId]
         } else {
             $this.LogDebug([LogSeverity]::Warning, "User [$UserId] not found. Refreshing users")
-            $this.LoadUsers()
+            [void]$this._ReloadUsersThrottled()
             $user = $this.Users[$UserId]
         }
 

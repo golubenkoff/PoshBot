@@ -16,6 +16,9 @@ and this project adheres to [Semantic Versioning](http://semver.org/).
 - SlackAppSM Socket Mode: acknowledge only envelopes that have an `envelope_id`, handle `hello`, `disconnect` (reconnect) and `interactive` envelopes, fixed `KeepAliveInterval` (was 5 ticks instead of 5 seconds).
 - `New-PoshBotCardResponse`: `DM` and `TH` are stored as booleans (were `$null`/switch objects that did not survive the job boundary).
 - Scheduled commands no longer reply into the thread of the message that created the schedule.
+- SlackAppSM: bot start-up took ~160 s (142 s of it for `conversations.list` over ~900 channels). Channels are no longer preloaded: names are resolved on demand with `conversations.info` and cached (unresolvable channels are remembered).
+- SlackAppSM: `BotAdmins` / `Add-GroupUser` accept a Slack user ID; a cache miss reloads the user list at most once per `UserReloadMinIntervalSeconds` (60) instead of on every lookup; removing outdated users no longer throws "Collection was modified" and uses a hash set instead of `-notin`.
+- SlackAppSM: `message_changed` events with unchanged text (unfurls, thread updates) are ignored - they re-ran regex-triggered commands a second time and replied outside the thread. Reaction errors now log the Slack error code.
 - Build: Pester task runs tests in a separate process and uses Pester 4.10.1 (3.4.0 does not work on current Windows PowerShell); PSScriptAnalyzer rule `PSProvideCommentHelp` excluded (crashes inside psake).
 
 ### Added

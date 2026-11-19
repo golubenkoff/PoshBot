@@ -36,13 +36,8 @@ class SlackAppSMConnection : Connection {
                 Authorization  = "Bearer $token_bot"
             }
 
-            $rc = Invoke-RestMethod -Method GET -Uri 'https://slack.com/api/conversations.list' -Headers @{
-                'Content-type' = 'application/x-www-form-urlencoded'
-                Authorization  = "Bearer $token_bot"
-            }
-
             $this.LoginData = [PsCustomObject]@{
-                channels = $rc.channels
+                channels = @()   # not preloaded: conversations.list is slow on large workspaces (see SlackAppSMBackend.ChannelIdToName)
                 self     = [PsCustomObject]@{
                     id = $rb.user_id
                 }
